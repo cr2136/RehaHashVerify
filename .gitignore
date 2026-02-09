@@ -1,0 +1,19 @@
+# Windows
+Thumbs.db
+Desktop.ini
+
+# PowerShell / Build Artifacts
+*.exe
+*.dll
+*.pdb
+*.zip
+
+# Logs / temp
+*.log
+*.tmp
+
+# VS Code
+.vscode/
+
+# PSReadLine history
+ConsoleHost_history.txt
