@@ -1,0 +1,3 @@
+This software is not an official government product.
+It is provided for educational and operational support purposes only.
+Use of this tool does not replace examiner training, validation, or independent verification.
