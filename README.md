@@ -44,3 +44,15 @@ Users are responsible for validating results and following their agency policies
 ## License
 
 MIT License
+
+## Downloads
+
+Compiled releases are available under the Releases section.
+
+## Verify downloads (recommended)
+
+After downloading a release asset, verify its SHA-256 hash:
+
+```powershell
+Get-FileHash .\GrayKeyHashVerify-v6.3.exe -Algorithm SHA256
+
