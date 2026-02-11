@@ -1,4 +1,4 @@
-# Forensic Hash Verifier
+# RehaHashVerify – Evidence Integrity Utility
 
 PowerShell-based utility for verifying cryptographic hashes of exported forensic evidence files and generating a structured verification report.
 
@@ -54,5 +54,5 @@ Compiled releases are available under the Releases section.
 After downloading a release asset, verify its SHA-256 hash:
 
 ```powershell
-Get-FileHash .\GrayKeyHashVerify-v6.3.exe -Algorithm SHA256
+Get-FileHash .\RehaHashVerify v1.0.exe -Algorithm SHA256
 
