@@ -54,5 +54,5 @@ Compiled releases are available under the Releases section.
 After downloading a release asset, verify its SHA-256 hash:
 
 ```powershell
-Get-FileHash .\RehaHashVerify v1.0.exe -Algorithm SHA256
+Get-FileHash .\RehaHashVerify v1.1.exe -Algorithm SHA256
 
