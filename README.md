@@ -24,7 +24,7 @@ The tool is intended to support verification of forensic exports from tools such
 ## Requirements
 
 - Windows
-- PowerShell 5.1 or later
+- Windows PowerShell 5.1 recommended (most compatible for WinForms builds). PowerShell 7 may require .NET Desktop Runtime.
 - .NET Framework (default on most Windows systems)
 
 ## Usage
@@ -54,5 +54,5 @@ Compiled releases are available under the Releases section.
 After downloading a release asset, verify its SHA-256 hash:
 
 ```powershell
-Get-FileHash .\RehaHashVerify v1.1.exe -Algorithm SHA256
+Get-FileHash ".\RehaHashVerifyv1.1.exe" -Algorithm SHA256
 
