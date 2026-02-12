@@ -1,81 +1,481 @@
 <#
-RehaHashVerify–EvidenceIntegrityUtility-v1.ps1
+RehaHashVerify – Evidence Integrity Utility (Modern UI)
+Compatible: Windows PowerShell 5.1 + PowerShell 7 (Windows)
 
-Fixes:
-- Normalizes file paths (trims, strips quotes, converts file:/// URI, rejects illegal chars)
-- Uses Test-Path -LiteralPath
-- Drag & drop supports multi-file (drop ZIP + Keychain together onto either box)
-- Run button normalizes paths again before starting BackgroundWorker (defense-in-depth)
-
-Targets:
-- ZIP + optional Keychain
-- SHA-256 first, then MD5
-- Optional metadata in report header
-- Accurate byte-based progress bar + cancel
-- Default report saved in same folder as ZIP (else keychain)
-- No PowerShell scriptblocks executed on BackgroundWorker thread (avoids runspace errors)
-
-Designed for:
-- PowerShell 5.1 (Desktop) / .NET Framework 4.x
+This version includes:
+- Modern Status Button
+- Error if MD5 and/or SHA256 value is incorrect 
+- Added path and open folder buttons
 #>
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# ---------------- App identity ----------------
 $AppName    = "RehaHashVerify – Evidence Integrity Utility"
-$AppVersion = "1.0"
+$AppVersion = "1.1"
 $BuildDate  = "2026-02-11"
 $AppOwner   = "Curtis Reha"
-
 $BuildStamp = "v$AppVersion ($BuildDate)"
 
+# ---------------- Helpers ----------------
+function Normalize-InputPath {
+    param([string]$Path)
 
-# ---------------- Build reference list for Add-Type (PS 5.1 / .NET Framework) ----------------
-function Get-AsmLocation([Type]$t) {
-    try { return $t.Assembly.Location } catch { return $null }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+
+    $p = ([string]$Path).Trim().Trim('"')
+
+    if ($p.StartsWith("<") -and $p.EndsWith(">")) {
+        $p = $p.Substring(1, $p.Length - 2).Trim()
+    }
+
+    # Convert file:/// URIs
+    if ($p -match '^\s*file:/{2,3}') {
+        try {
+            $u = [Uri]$p
+            if ($u -and $u.IsFile) { $p = $u.LocalPath }
+        } catch {}
+    }
+
+    # Remove control/format/non-printing chars
+    $p = [regex]::Replace($p, '\p{C}', '')
+
+    return $p.Trim()
 }
 
-$refPaths = New-Object System.Collections.Generic.List[string]
+function Get-IllegalPathCharsReport {
+    param([string]$p)
 
-$mscorlib = Get-AsmLocation ([object])
-if ($mscorlib -and -not $refPaths.Contains($mscorlib)) { $refPaths.Add($mscorlib) }
+    if ([string]::IsNullOrWhiteSpace($p)) { return "Path is empty." }
 
-$systemDll = Get-AsmLocation ([System.ComponentModel.BackgroundWorker])
-if ($systemDll -and -not $refPaths.Contains($systemDll)) { $refPaths.Add($systemDll) }
+    $bad = @()
+    $invalid = [System.IO.Path]::GetInvalidPathChars()
 
-$systemCoreDll = Get-AsmLocation ([System.Linq.Enumerable])
-if ($systemCoreDll -and -not $refPaths.Contains($systemCoreDll)) { $refPaths.Add($systemCoreDll) }
+    foreach ($ch in $p.ToCharArray()) {
+        $code = [int][char]$ch
+        if ($ch -match '\p{C}') {
+            $bad += ("U+{0:X4} (Unicode category C)" -f $code)
+            continue
+        }
+        if ($invalid -contains $ch) {
+            $bad += ("U+{0:X4} (InvalidPathChar '{1}')" -f $code, $ch)
+        }
+    }
 
-$winFormsDll = Get-AsmLocation ([System.Windows.Forms.Form])
-if ($winFormsDll -and -not $refPaths.Contains($winFormsDll)) { $refPaths.Add($winFormsDll) }
+    if ($bad.Count -eq 0) { return "No illegal chars detected." }
+    return "Illegal/invisible characters found:`r`n" + ($bad -join "`r`n")
+}
 
-$secDll = Get-AsmLocation ([System.Security.Cryptography.HashAlgorithm])
-if ($secDll -and -not $refPaths.Contains($secDll)) { $refPaths.Add($secDll) }
+# --- Expected hash validation (NO binding errors on empty string) ---
+function Test-ExpectedHash {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value,
 
-try {
-    $loaded = [System.Reflection.Assembly]::Load("System.Security")
-    if ($loaded -and (Test-Path $loaded.Location) -and -not $refPaths.Contains($loaded.Location)) { $refPaths.Add($loaded.Location) }
-} catch {}
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('SHA256','MD5')]
+        [string]$Alg,
 
-# ---------------- C# worker (no runspace dependency on worker thread) ----------------
-if ($DEBUG_CSHARP_DUMP) {
-    $dumpPath = Join-Path $env:TEMP "ForensicTool_CSharpDump.cs"
-    Set-Content -Path $dumpPath -Value $cs -Encoding UTF8
-    if ($cs -match '>>>') {
-        [System.Windows.Forms.MessageBox]::Show("Found '>>>' inside embedded C#.`r`nDumped to:`r`n$dumpPath", "C# Marker Found", "OK", "Error") | Out-Null
-    } else {
-        [System.Windows.Forms.MessageBox]::Show("No '>>>' found by regex in embedded C#.`r`nDumped to:`r`n$dumpPath", "C# Dumped", "OK", "Information") | Out-Null
+        [Parameter(Mandatory=$true)]
+        [string]$LabelForError
+    )
+
+    $v = ""
+    if ($null -ne $Value) { $v = [string]$Value }
+
+    $v = ($v -replace '\s','').Trim()
+
+    # Blank allowed => "no expected hash provided"
+    if ([string]::IsNullOrWhiteSpace($v)) {
+        return @{ Ok = $true; Normalized = "" }
+    }
+
+    $expectedLen = if ($Alg -eq 'SHA256') { 64 } else { 32 }
+
+    if ($v.Length -ne $expectedLen) {
+        return @{
+            Ok = $false
+            Normalized = $v.ToUpperInvariant()
+            Error = ("Invalid {0} input for {1}. Expected {2} hex characters, got {3}." -f $Alg, $LabelForError, $expectedLen, $v.Length)
+        }
+    }
+
+    if ($v -notmatch '^[0-9a-fA-F]+$') {
+        return @{
+            Ok = $false
+            Normalized = $v.ToUpperInvariant()
+            Error = ("Invalid {0} input for {1}. Only hex characters allowed (0-9, A-F)." -f $Alg, $LabelForError)
+        }
+    }
+
+    return @{ Ok = $true; Normalized = $v.ToUpperInvariant() }
+}
+
+function Build-DefaultReportPath {
+    param(
+        [Parameter(Mandatory=$true)][string]$BaseDir,
+        [string]$CaseNumber,
+        [string]$ItemNumber
+    )
+    $ts  = (Get-Date).ToString("yyyyMMdd_HHmmss")
+    $caseTag = ""
+    if ($CaseNumber) { $caseTag += "_CASE-$($CaseNumber.Trim())" }
+    if ($ItemNumber) { $caseTag += "_ITEM-$($ItemNumber.Trim())" }
+    Join-Path $BaseDir ("RehaHashVerify{0}_{1}.txt" -f $caseTag, $ts)
+}
+
+function Convert-DictToHashtable($dict) {
+    if (-not $dict) { return $null }
+    $ht = @{}
+    foreach ($k in $dict.Keys) { $ht[$k] = $dict[$k] }
+    return $ht
+}
+
+function Write-CombinedReport {
+    param(
+        [Parameter(Mandatory=$true)][string]$ReportPath,
+        [Parameter(Mandatory=$true)][hashtable]$Meta,
+        [hashtable]$ZipSection,
+        [hashtable]$KeychainSection
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(("=" * 78))
+    $lines.Add($AppName)
+    $lines.Add("Tool Version: $BuildStamp")
+    $lines.Add("Purpose: Independent hash verification of delivered evidence files.")
+    $lines.Add("Generated: {0}" -f $Meta.GeneratedLocal)
+    $lines.Add(("=" * 78))
+
+    if ($Meta.CaseNumber) { $lines.Add("Case #:    {0}" -f $Meta.CaseNumber) }
+    if ($Meta.ItemNumber) { $lines.Add("Item #:    {0}" -f $Meta.ItemNumber) }
+    if ($Meta.Examiner)   { $lines.Add("Examiner:  {0}" -f $Meta.Examiner) }
+
+    $lines.Add(("=" * 78))
+    $lines.Add("")
+
+    function Get-SecVal {
+        param([object]$sec, [string]$key)
+        if ($null -eq $sec) { return "" }
+        if ($sec -is [System.Collections.IDictionary] -and $sec.Contains($key)) { return [string]$sec[$key] }
+        return ""
+    }
+
+    function Add-FileSection([string]$Title, [hashtable]$S) {
+        if (-not $S) { return }
+        $lines.Add($Title)
+        $lines.Add(("-" * 78))
+        $lines.Add("Target File: {0}" -f (Get-SecVal $S 'FilePath'))
+        $lines.Add("File Size : {0} bytes" -f (Get-SecVal $S 'SizeBytes'))
+        $lines.Add("")
+        $lines.Add("SHA-256")
+        $lines.Add("  Expected: {0}" -f (Get-SecVal $S 'SHA256_Expected'))
+        $lines.Add("  Actual  : {0}" -f (Get-SecVal $S 'SHA256_Actual'))
+        $lines.Add("  Result  : {0}" -f (Get-SecVal $S 'SHA256_Result'))
+        $lines.Add("")
+        $lines.Add("MD5")
+        $lines.Add("  Expected: {0}" -f (Get-SecVal $S 'MD5_Expected'))
+        $lines.Add("  Actual  : {0}" -f (Get-SecVal $S 'MD5_Actual'))
+        $lines.Add("  Result  : {0}" -f (Get-SecVal $S 'MD5_Result'))
+        $lines.Add("")
+        $lines.Add("File Result: {0}" -f (Get-SecVal $S 'FileOverall'))
+        $lines.Add("")
+    }
+
+    if ($ZipSection)      { Add-FileSection 'ZIP FILE'      $ZipSection }
+    if ($KeychainSection) { Add-FileSection 'KEYCHAIN FILE' $KeychainSection }
+
+    $lines.Add(('=' * 78))
+    $lines.Add(('OVERALL RESULT: {0}' -f $Meta.OverallResult))
+    $lines.Add(('=' * 78))
+    $lines.Add("")
+    $lines.Add(("=" * 78))
+    $lines.Add("Generated by $AppName ($BuildStamp). Owner: $AppOwner")
+    $lines.Add(("=" * 78))
+
+    $outDir = Split-Path -Parent $ReportPath
+    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    }
+
+    [System.IO.File]::WriteAllLines($ReportPath, $lines.ToArray(), [System.Text.Encoding]::UTF8)
+}
+
+# ---------------- Drag/drop routing ----------------
+function Apply-DroppedFiles {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Files,
+        [Parameter(Mandatory=$true)][object]$DroppedOnBox,
+        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$ZipBox,
+        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$KcBox
+    )
+
+    foreach ($f in $Files) {
+        $p = Normalize-InputPath -Path ([string]$f)
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+
+        $lower = $p.ToLowerInvariant()
+
+        if ($lower -match '\.zip$') { $ZipBox.Text = $p; continue }
+
+        if ($lower -match '\.(keychain|keychain-db|kc|db|sqlite|sqlite3|plist)$' -or
+            ([System.IO.Path]::GetFileName($p).ToLowerInvariant().Contains("keychain"))) {
+            $KcBox.Text = $p; continue
+        }
+
+        if ($DroppedOnBox -is [System.Windows.Forms.TextBox]) { $DroppedOnBox.Text = $p } else { $ZipBox.Text = $p }
     }
 }
 
+function Enable-DropToBox {
+    param(
+        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$Box,
+        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$ZipBox,
+        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$KcBox
+    )
 
+    $Box.AllowDrop = $true
 
-Add-Type -Language CSharp -TypeDefinition @"
+    $Box.Add_DragEnter({
+        param($sender, $e)
+        if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+            $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+        } else {
+            $e.Effect = [System.Windows.Forms.DragDropEffects]::None
+        }
+    }.GetNewClosure())
+
+    $Box.Add_DragDrop({
+        param($sender, $e)
+        $files = $e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
+        if ($files -and $files.Count -ge 1) {
+            Apply-DroppedFiles -Files $files -DroppedOnBox $sender -ZipBox $ZipBox -KcBox $KcBox
+        }
+    }.GetNewClosure())
+}
+
+# ---------------- Input highlight + Modern ----------------
+$script:DefaultTextBoxBackColor = [System.Drawing.SystemColors]::Window
+$script:DefaultTextBoxForeColor = [System.Drawing.SystemColors]::WindowText
+
+function Clear-InputHighlight {
+    param([Parameter(Mandatory)][System.Windows.Forms.TextBox]$Box)
+    $Box.BackColor = $script:DefaultTextBoxBackColor
+    $Box.ForeColor = $script:DefaultTextBoxForeColor
+}
+
+function Mark-InputInvalid {
+    param([Parameter(Mandatory)][System.Windows.Forms.TextBox]$Box)
+    $Box.BackColor = [System.Drawing.Color]::MistyRose
+    $Box.ForeColor = [System.Drawing.Color]::FromArgb(120, 0, 0)
+}
+
+function Shake-Control {
+    param(
+        [Parameter(Mandatory)][System.Windows.Forms.Control]$Control,
+        [int]$Amplitude = 6,
+        [int]$Shakes = 8,
+        [int]$IntervalMs = 15
+    )
+
+    if (-not $Control -or $Control.IsDisposed) { return }
+
+    $orig = $Control.Location
+    $tick = 0
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = $IntervalMs
+
+    $timer.Add_Tick({
+        try {
+            $tick++
+            $dir = if (($tick % 2) -eq 0) { -1 } else { 1 }
+            $dx  = $dir * $Amplitude
+
+            $Control.Location = New-Object System.Drawing.Point(($orig.X + $dx), $orig.Y)
+
+            if ($tick -ge $Shakes) {
+                $timer.Stop()
+                $Control.Location = $orig
+                $timer.Dispose()
+            }
+        } catch {
+            try { $timer.Stop(); $timer.Dispose() } catch {}
+        }
+    }.GetNewClosure())
+
+    $timer.Start()
+}
+
+# ---------------- Modern rounded look (C# older-compiler safe) ----------------
+$uiNs = "RehaHashVerify.UI_" + ([Guid]::NewGuid().ToString("N"))
+
+$uiCs = @"
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+namespace $uiNs
+{
+    public class PillLabel : Control
+    {
+        public int CornerRadius { get; set; }
+        public int BorderThickness { get; set; }
+        public Color BorderColor { get; set; }
+
+        public int ShadowOffsetX { get; set; }
+        public int ShadowOffsetY { get; set; }
+        public int ShadowBlur { get; set; }
+        public Color ShadowColor { get; set; }
+
+        public PillLabel()
+        {
+            SetStyle(ControlStyles.UserPaint |
+                     ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+
+            CornerRadius = 20;
+            BorderThickness = 1;
+            BorderColor = Color.FromArgb(20, 90, 60);
+
+            ShadowOffsetX = 0;
+            ShadowOffsetY = 3;
+            ShadowBlur = 10;
+            ShadowColor = Color.FromArgb(60, 0, 0, 0);
+
+            Font = new Font("Segoe UI", 12, FontStyle.Bold);
+            ForeColor = Color.White;
+            BackColor = Color.FromArgb(25, 135, 84);
+            Padding = new Padding(20, 10, 20, 10);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            var rect = ClientRectangle;
+            if (rect.Width <= 0 || rect.Height <= 0) return;
+
+            if (ShadowBlur > 0)
+            {
+                for (int i = ShadowBlur; i >= 1; i--)
+                {
+                    int a = (int)(ShadowColor.A * (i / (float)(ShadowBlur * 2)));
+                    if (a < 1) a = 1;
+
+                    using (var shadowBrush = new SolidBrush(Color.FromArgb(a, ShadowColor.R, ShadowColor.G, ShadowColor.B)))
+                    {
+                        var sr = Rectangle.Inflate(rect, -1, -1);
+                        sr.Offset(ShadowOffsetX, ShadowOffsetY);
+                        sr = Rectangle.Inflate(sr, i/3, i/3);
+                        using (var sp = RoundedRect(sr, CornerRadius + i/3))
+                        {
+                            e.Graphics.FillPath(shadowBrush, sp);
+                        }
+                    }
+                }
+            }
+
+            var drawRect = Rectangle.Inflate(rect, -1, -1);
+            using (var path = RoundedRect(drawRect, CornerRadius))
+            using (var fill = new SolidBrush(BackColor))
+            {
+                e.Graphics.FillPath(fill, path);
+
+                if (BorderThickness > 0)
+                {
+                    using (var pen = new Pen(BorderColor, BorderThickness))
+                    {
+                        pen.Alignment = PenAlignment.Inset;
+                        e.Graphics.DrawPath(pen, path);
+                    }
+                }
+            }
+
+            var textRect = new Rectangle(
+                rect.Left + Padding.Left,
+                rect.Top + Padding.Top,
+                rect.Width - Padding.Horizontal,
+                rect.Height - Padding.Vertical
+            );
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                Text,
+                Font,
+                textRect,
+                ForeColor,
+                TextFormatFlags.HorizontalCenter |
+                TextFormatFlags.VerticalCenter |
+                TextFormatFlags.EndEllipsis |
+                TextFormatFlags.NoPadding
+            );
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+            int rr = Math.Max(2, radius);
+            int d = rr * 2;
+            if (d > r.Width) d = r.Width;
+            if (d > r.Height) d = r.Height;
+
+            var arc = new Rectangle(r.Location, new Size(d, d));
+
+            path.AddArc(arc, 180, 90);
+            arc.X = r.Right - d;
+            path.AddArc(arc, 270, 90);
+            arc.Y = r.Bottom - d;
+            path.AddArc(arc, 0, 90);
+            arc.X = r.Left;
+            path.AddArc(arc, 90, 90);
+
+            path.CloseFigure();
+            return path;
+        }
+
+        public void AutoSizeToContent()
+        {
+            using (var g = CreateGraphics())
+            {
+                var sz = TextRenderer.MeasureText(g, Text, Font,
+                    new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.NoPadding);
+
+                Width  = sz.Width + Padding.Horizontal + 18;
+                Height = sz.Height + Padding.Vertical + 14;
+            }
+        }
+    }
+}
+"@
+
+$uiTypes = Add-Type -Language CSharp -TypeDefinition $uiCs -ReferencedAssemblies @(
+    [System.Drawing.Color].Assembly.Location,
+    [System.Windows.Forms.Form].Assembly.Location
+) -PassThru
+
+$PillLabelType = $uiTypes | Where-Object FullName -eq "$uiNs.PillLabel"
+if (-not $PillLabelType) { throw "Failed to compile PillLabel type." }
+
+# ---------------- Hash worker (C#) with unique namespace ----------------
+$hashNs = "RehaHashVerify.Hash_" + ([Guid]::NewGuid().ToString("N"))
+
+$hashCs = @"
 using System;
 using System.IO;
 using System.Security.Cryptography;
 using System.ComponentModel;
 using System.Collections.Generic;
+
+namespace $hashNs {
 
 public class HashJobArgs {
     public string ZipPath;
@@ -99,29 +499,18 @@ public class HashWorker {
         return s.ToUpperInvariant();
     }
 
-    // Only use \\?\ long path prefix when needed
-    private static string ToExtendedPath(string path) {
-        if (String.IsNullOrWhiteSpace(path)) return path;
-        string full = Path.GetFullPath(path);
-
-        if (full.StartsWith(@"\\", StringComparison.Ordinal)) {
-            string unc = full.TrimStart('\\');
-            return @"\\?\UNC\" + unc;
-        }
-
-        return @"\\?\" + full;
+    private static bool NeedsExtendedPath(string fullPath) {
+        if (String.IsNullOrWhiteSpace(fullPath)) return false;
+        return fullPath.Length >= 240;
     }
 
-    private static string DumpChars(string s) {
-        if (s == null) return "<null>";
-        var sb = new System.Text.StringBuilder();
-        for (int i = 0; i < s.Length; i++) {
-            char c = s[i];
-            int code = (int)c;
-            string shown = Char.IsControl(c) ? "" : c.ToString();
-            sb.AppendFormat("[{0}] U+{1:X4} '{2}' ", i, code, shown);
+    private static string ToExtendedPath(string fullPath) {
+        if (String.IsNullOrWhiteSpace(fullPath)) return fullPath;
+        if (fullPath.StartsWith(@"\\", StringComparison.Ordinal)) {
+            string unc = fullPath.TrimStart('\\');
+            return @"\\?\UNC\" + unc;
         }
-        return sb.ToString();
+        return @"\\?\" + fullPath;
     }
 
     private static string HashFileWithProgress(
@@ -131,64 +520,70 @@ public class HashWorker {
         int basePct,
         int spanPct)
     {
-        try {
-            if (String.IsNullOrWhiteSpace(path))
-                throw new InvalidOperationException("File path was empty.");
+        if (String.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException("File path was empty.");
 
-            // If the path is getting long, try extended prefix; otherwise keep normal path (most compatible)
-            string openPath = path;
-            if (path.Length >= 240) openPath = ToExtendedPath(path);
+        string full = Path.GetFullPath(path);
+        var fi = new FileInfo(full);
+        long total = fi.Length;
+        if (total <= 0) throw new InvalidOperationException("File size is zero or could not be read: " + full);
 
-            var fi = new FileInfo(path);
-            long total = fi.Length;
-            if (total <= 0) throw new InvalidOperationException("File size is zero or could not be read: " + path);
+        byte[] buffer = new byte[4 * 1024 * 1024];
+        long readSoFar = 0;
 
-            byte[] buffer = new byte[4 * 1024 * 1024]; // 4MB
-            long readSoFar = 0;
+        var state = new Dictionary<string, object>();
+        state["Path"] = full;
+        state["Algorithm"] = algorithm;
+        state["BytesRead"] = 0L;
+        state["TotalBytes"] = total;
 
-            using (FileStream fs = File.Open(openPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-            {
-                HashAlgorithm hasher;
-                if (String.Equals(algorithm, "SHA256", StringComparison.OrdinalIgnoreCase))
-                    hasher = SHA256.Create();
-                else if (String.Equals(algorithm, "MD5", StringComparison.OrdinalIgnoreCase))
-                    hasher = MD5.Create();
-                else
-                    throw new InvalidOperationException("Unsupported algorithm: " + algorithm);
+        HashAlgorithm hasher;
+        if (String.Equals(algorithm, "SHA256", StringComparison.OrdinalIgnoreCase))
+            hasher = SHA256.Create();
+        else if (String.Equals(algorithm, "MD5", StringComparison.OrdinalIgnoreCase))
+            hasher = MD5.Create();
+        else
+            throw new InvalidOperationException("Unsupported algorithm: " + algorithm);
 
-                using (hasher)
-                {
-                    int bytesRead;
-                    while ((bytesRead = fs.Read(buffer, 0, buffer.Length)) > 0)
-                    {
-                        if (bw.CancellationPending)
-                            throw new OperationCanceledException("Cancelled");
+        using (hasher)
+        {
+            string openPath = full;
+            if (NeedsExtendedPath(full)) openPath = ToExtendedPath(full);
 
-                        hasher.TransformBlock(buffer, 0, bytesRead, null, 0);
-                        readSoFar += bytesRead;
-
-                        int pct = basePct + (int)Math.Floor(((double)readSoFar / (double)total) * spanPct);
-                        if (pct > basePct + spanPct) pct = basePct + spanPct;
-
-                        var state = new Dictionary<string, object>();
-                        state["Path"] = path;
-                        state["Algorithm"] = algorithm;
-                        state["BytesRead"] = readSoFar;
-                        state["TotalBytes"] = total;
-
-                        bw.ReportProgress(pct, state);
-                    }
-
-                    hasher.TransformFinalBlock(new byte[0], 0, 0);
-                    return BitConverter.ToString(hasher.Hash).Replace("-", "").ToUpperInvariant();
+            FileStream fs = null;
+            try {
+                fs = File.Open(openPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            } catch (PathTooLongException) {
+                fs = File.Open(ToExtendedPath(full), FileMode.Open, FileAccess.Read, FileShare.Read);
+            } catch (IOException) {
+                if (!openPath.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+                    fs = File.Open(ToExtendedPath(full), FileMode.Open, FileAccess.Read, FileShare.Read);
+                } else {
+                    throw;
                 }
             }
-        }
-        catch (Exception ex) {
-            throw new InvalidOperationException(
-                "HashFileWithProgress failed. path=[" + path + "] chars=" + DumpChars(path),
-                ex
-            );
+
+            using (fs)
+            {
+                int bytesRead;
+                while ((bytesRead = fs.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    if (bw.CancellationPending)
+                        throw new OperationCanceledException("Cancelled");
+
+                    hasher.TransformBlock(buffer, 0, bytesRead, null, 0);
+                    readSoFar += bytesRead;
+
+                    int pct = basePct + (int)Math.Floor(((double)readSoFar / (double)total) * spanPct);
+                    if (pct > basePct + spanPct) pct = basePct + spanPct;
+
+                    state["BytesRead"] = readSoFar;
+                    bw.ReportProgress(pct, state);
+                }
+
+                hasher.TransformFinalBlock(new byte[0], 0, 0);
+                return BitConverter.ToString(hasher.Hash).Replace("-", "").ToUpperInvariant();
+            }
         }
     }
 
@@ -232,17 +627,23 @@ public class HashWorker {
     }
 
     public void DoWork(object sender, DoWorkEventArgs e) {
-        var bw = sender as BackgroundWorker;
-        var a = e.Argument as HashJobArgs;
+        var bw = (BackgroundWorker)sender;
+        var a = (HashJobArgs)e.Argument;
+
+        bool hasZip = !String.IsNullOrWhiteSpace(a.ZipPath);
+        bool hasKc  = !String.IsNullOrWhiteSpace(a.KcPath);
 
         Dictionary<string, object> zipSec = null;
-        Dictionary<string, object> kcSec = null;
+        Dictionary<string, object> kcSec  = null;
 
-        if (!String.IsNullOrWhiteSpace(a.ZipPath))
+        if (hasZip && hasKc) {
+            zipSec = ComputeSection(bw, a.ZipPath, a.ZipExpSHA, a.ZipExpMD5, 0, 50);
+            kcSec  = ComputeSection(bw, a.KcPath,  a.KcExpSHA,  a.KcExpMD5,  50, 50);
+        } else if (hasZip) {
             zipSec = ComputeSection(bw, a.ZipPath, a.ZipExpSHA, a.ZipExpMD5, 0, 100);
-
-        if (!String.IsNullOrWhiteSpace(a.KcPath))
-            kcSec = ComputeSection(bw, a.KcPath, a.KcExpSHA, a.KcExpMD5, 0, 100);
+        } else if (hasKc) {
+            kcSec  = ComputeSection(bw, a.KcPath,  a.KcExpSHA,  a.KcExpMD5,  0, 100);
+        }
 
         string overall = "PASS";
         if (zipSec != null && (string)zipSec["FileOverall"] == "FAIL") overall = "FAIL";
@@ -251,7 +652,7 @@ public class HashWorker {
         var result = new Dictionary<string, object>();
         result["Overall"] = overall;
         result["ZipSection"] = zipSec;
-        result["KcSection"] = kcSec;
+        result["KcSection"]  = kcSec;
 
         var meta = new Dictionary<string, object>();
         meta["CaseNumber"] = a.CaseNum ?? "";
@@ -262,624 +663,336 @@ public class HashWorker {
         e.Result = result;
     }
 }
+
+}
 "@
 
+$hashTypes = Add-Type -Language CSharp -TypeDefinition $hashCs -ReferencedAssemblies @(
+    [System.Security.Cryptography.SHA256].Assembly.Location,
+    [System.ComponentModel.BackgroundWorker].Assembly.Location,
+    [System.IO.File].Assembly.Location
+) -PassThru
 
-# ---------------- PowerShell helpers ----------------
-function Build-DefaultReportPath {
-    param(
-        [Parameter(Mandatory)][string]$BaseDir,
-        [string]$CaseNumber,
-        [string]$ItemNumber
-    )
-    $ts  = (Get-Date).ToString("yyyyMMdd_HHmmss")
-    $caseTag = ""
-    if ($CaseNumber) { $caseTag += "_CASE-$($CaseNumber.Trim())" }
-    if ($ItemNumber) { $caseTag += "_ITEM-$($ItemNumber.Trim())" }
-    Join-Path $BaseDir ("ForensicTool_HashVerify{0}_{1}.txt" -f $caseTag, $ts)
-}
-
-function Convert-DictToHashtable($dict) {
-    if (-not $dict) { return $null }
-    $ht = @{}
-    foreach ($k in $dict.Keys) { $ht[$k] = $dict[$k] }
-    return $ht
-}
-
-function Write-CombinedReport {
-    param(
-        [Parameter(Mandatory)][string]$ReportPath,
-        [Parameter(Mandatory)][hashtable]$Meta,
-        [hashtable]$ZipSection,
-        [hashtable]$KeychainSection
-    )
-$lines = New-Object System.Collections.Generic.List[string]
-$lines.Add(("=" * 78))
-$lines.Add("RehaHashVerify – Evidence Integrity Utility")
-$lines.Add("Tool Version: v1.0")
-$lines.Add("Purpose: Independent hash verification of delivered evidence files.")
-
-$lines.Add("Generated: {0}" -f $Meta.GeneratedLocal)
-$lines.Add(("=" * 78))
-
-
-    if ($Meta.CaseNumber) { $lines.Add("Case #:    {0}" -f $Meta.CaseNumber) }
-    if ($Meta.ItemNumber) { $lines.Add("Item #:    {0}" -f $Meta.ItemNumber) }
-    if ($Meta.Examiner)   { $lines.Add("Examiner:  {0}" -f $Meta.Examiner) }
-
-    $lines.Add(("=" * 78))
-    $lines.Add("")
-
-function Get-SecVal {
-    param([object]$sec, [string]$key)
-
-    if ($null -eq $sec) { return "" }
-
-    # Dictionary coming from C# Add-Type usually looks like a Hashtable in PS
-    if ($sec -is [System.Collections.IDictionary] -and $sec.Contains($key)) {
-        return [string]$sec[$key]
-    }
-
-    return ""
-}
-
-
-function Add-FileSection([string]$Title, [hashtable]$S) {
-    if (-not $S) { return }
-
-    $lines.Add($Title)
-    $lines.Add(("-" * 78))
-
-    $lines.Add("Target File: {0}" -f (Get-SecVal $S 'FilePath'))
-    $lines.Add("File Size : {0} bytes" -f (Get-SecVal $S 'SizeBytes'))
-    $lines.Add("")
-
-    $lines.Add("SHA-256")
-    $lines.Add("  Expected: {0}" -f (Get-SecVal $S 'SHA256_Expected'))
-    $lines.Add("  Actual  : {0}" -f (Get-SecVal $S 'SHA256_Actual'))
-    $lines.Add("  Result  : {0}" -f (Get-SecVal $S 'SHA256_Result'))
-    $lines.Add("")
-
-    $lines.Add("MD5")
-    $lines.Add("  Expected: {0}" -f (Get-SecVal $S 'MD5_Expected'))
-    $lines.Add("  Actual  : {0}" -f (Get-SecVal $S 'MD5_Actual'))
-    $lines.Add("  Result  : {0}" -f (Get-SecVal $S 'MD5_Result'))
-    $lines.Add("")
-
-    $lines.Add("File Result: {0}" -f (Get-SecVal $S 'FileOverall'))
-    $lines.Add("")
-}
-
-    # --- Sections ---
-    if ($ZipSection)     { Add-FileSection 'ZIP FILE'      $ZipSection }
-    if ($KeychainSection){ Add-FileSection 'KEYCHAIN FILE' $KeychainSection }
-
-    $lines.Add(('=' * 78))
-    $lines.Add(('OVERALL RESULT: {0}' -f $Meta.OverallResult))
-    $lines.Add(('=' * 78))
-	
-	
-# Footer (Tool provenance)
-$lines.Add("")
-$lines.Add(("=" * 78))
-$lines.Add("Generated by RehaHashVerify – Evidence Integrity Utility (v1.0).")
-$lines.Add(("=" * 78))
-
-    # Ensure output directory exists
-    $outDir = Split-Path -Parent $ReportPath
-    if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
-        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-    }
-
-    # Write report (UTF-8) 
-    [System.IO.File]::WriteAllLines($ReportPath, $lines.ToArray(), [System.Text.Encoding]::UTF8)
-}
-
-# ---------------- Path normalization + drop routing (NEW) ----------------
-function Normalize-InputPath {
-    param([string]$Path)
-
-    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
-
-    $p = $Path
-
-    # Convert to string, then trim outer whitespace
-    $p = ([string]$p).Trim()
-
-    # Remove wrapping quotes
-    $p = $p.Trim('"')
-
-    # Remove wrapping angle brackets
-    if ($p.StartsWith("<") -and $p.EndsWith(">")) {
-        $p = $p.Substring(1, $p.Length - 2).Trim()
-    }
-
-    # Remove ALL control/format/non-printing chars anywhere (includes CR/LF/TAB/zero-width/LRM/RLM)
-    $p = [regex]::Replace($p, '\p{C}', '')
-
-    # Final trim
-    return $p.Trim()
-}
-
-
-function Get-IllegalPathCharsReport {
-    param([string]$p)
-
-    if ([string]::IsNullOrWhiteSpace($p)) { return "Path is empty." }
-
-    $bad = @()
-
-    foreach ($ch in $p.ToCharArray()) {
-        $code = [int][char]$ch
-
-        # Flag anything that is not printable ASCII-ish (control/format)
-        if ($ch -match '\p{C}') {
-            $bad += ("U+{0:X4} (Unicode category C)" -f $code)
-            continue
-        }
-
-        # Flag invalid path chars
-        if ([System.IO.Path]::GetInvalidPathChars() -contains $ch) {
-            $bad += ("U+{0:X4} (InvalidPathChar '{1}')" -f $code, $ch)
-        }
-    }
-
-    if ($bad.Count -eq 0) { return "No illegal chars detected." }
-
-    return "Illegal/invisible characters found:`r`n" + ($bad -join "`r`n")
-}
-
-
-function Set-PathIfValid {
-    param([System.Windows.Forms.TextBox]$Box, [string]$Path)
-
-    try {
-        $p = Normalize-InputPath -Path $Path
-        if ([string]::IsNullOrWhiteSpace($p)) { return $false }
-        if (-not (Test-Path -LiteralPath $p)) { return $false }
-
-        $Box.Text = $p
-        return $true
-    }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Invalid Path", "OK", "Error") | Out-Null
-        return $false
-    }
-}
-
-# identify ZIP vs "keychain-ish" by extension
-function Get-FileRole {
-    param([string]$Path)
-
-    $ext = ([string][System.IO.Path]::GetExtension($Path)).ToLowerInvariant()
-
-    if ($ext -eq ".zip") { return "zip" }
-
-    # Tool exports vary; allow common keychain-ish extensions
-    if ($ext -in @(".keychain", ".keychain-db", ".kc", ".db", ".sqlite", ".sqlite3")) { return "kc" }
-
-    # If it literally contains "keychain" in name, treat as keychain
-    if ([System.IO.Path]::GetFileName($Path).ToLowerInvariant().Contains("keychain")) { return "kc" }
-
-    return "unknown"
-}
-
-function Apply-DroppedFiles {
-    param(
-        [Parameter(Mandatory=$true)][string[]]$Files,
-        [Parameter(Mandatory=$true)][object]$DroppedOnBox,
-        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$ZipBox,
-        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$KcBox
-    )
-
-    # Normalize DroppedOnBox to an actual TextBox if possible
-    $targetBox = $null
-    if ($DroppedOnBox -is [System.Windows.Forms.TextBox]) {
-        $targetBox = $DroppedOnBox
-    } elseif ($DroppedOnBox -is [System.Windows.Forms.Control] -and $DroppedOnBox.PSObject.Properties.Match('Text').Count -gt 0) {
-        $targetBox = $DroppedOnBox
-    }
-
-    foreach ($f in $Files) {
-        $p = Normalize-InputPath -Path ([string]$f)
-        if ([string]::IsNullOrWhiteSpace($p)) { continue }
-
-        switch -Regex ($p.ToLowerInvariant()) {
-            '\.zip$' {
-                $ZipBox.Text = $p
-                continue
-            }
-
-            # tweak this list if your keychain extension is different
-            '\.(keychain|keychain-db|db|sqlite|plist)$' {
-                $KcBox.Text = $p
-                continue
-            }
-
-            default {
-                if ($targetBox -and $targetBox.PSObject.Properties.Match('Text').Count -gt 0) {
-                    $targetBox.Text = $p
-                }
-            }
-        }
-    }
-}
-
-function Enable-DropToBox {
-    param(
-        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$Box,
-        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$ZipBox,
-        [Parameter(Mandatory=$true)][System.Windows.Forms.TextBox]$KcBox
-    )
-
-    $Box.AllowDrop = $true
-
-    $Box.Add_DragEnter({
-        param($sender, $e)
-        if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
-            $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy
-        } else {
-            $e.Effect = [System.Windows.Forms.DragDropEffects]::None
-        }
-    }.GetNewClosure())
-
-    $Box.Add_DragDrop({
-        param($sender, $e)
-
-        $files = $e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
-        if ($files -and $files.Count -ge 1) {
-            Apply-DroppedFiles -Files $files -DroppedOnBox $sender -ZipBox $ZipBox -KcBox $KcBox
-        }
-    }.GetNewClosure())
-}
-
-
-function Set-ChipState {
-    param(
-        [Parameter(Mandatory=$true)][string]$Text,
-        [Parameter(Mandatory=$true)][int[]]$Rgb
-    )
-
-    if ($script:lblChip) {
-        $script:lblChip.Text = $Text
-        $script:lblChip.BackColor = [System.Drawing.Color]::FromArgb($Rgb[0], $Rgb[1], $Rgb[2])
-    }
-}
+$HashJobType    = $hashTypes | Where-Object FullName -eq "$hashNs.HashJobArgs"
+$HashWorkerType = $hashTypes | Where-Object FullName -eq "$hashNs.HashWorker"
+if (-not $HashJobType -or -not $HashWorkerType) { throw "Failed to compile hash worker types." }
 
 # ---------------- UI ----------------
 $form = New-Object System.Windows.Forms.Form
-# ===== App Branding / Header (paste AFTER: $form = New-Object System.Windows.Forms.Form) =====
-$AppName    = "RehaHashVerify–Evidence Integrity Utility"
-$AppVersion = "1.0"
-$AppOwner   = "Curtis Reha"
-$BuildStamp = (Get-Date).ToString("yyyy-MM-dd")
-
-# Title bar + subtle background
-$form.Text      = "$AppName (ZIP + Keychain) - v$AppVersion"
-$form.BackColor = [System.Drawing.Color]::FromArgb(245,245,245)
-
-# ASCII banner (monospace)
-$lblBanner = New-Object System.Windows.Forms.Label
-$lblBanner.AutoSize  = $true
-$lblBanner.Font      = New-Object System.Drawing.Font("Cascadia Mono", 10, [System.Drawing.FontStyle]::Bold)
-$lblBanner.ForeColor = [System.Drawing.Color]::FromArgb(20,20,20)
-$lblBanner.Text = @"
-[$($AppName.ToUpper())]  v$AppVersion
-> HASH  |  VERIFY  |  REPORT
-"@
-$lblBanner.Location = New-Object System.Drawing.Point(12, 10)
-$form.Controls.Add($lblBanner)
-
-# "Status chip" - READY
-$script:lblChip = New-Object System.Windows.Forms.Label
-$script:lblChip.AutoSize  = $true
-$script:lblChip.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-$script:lblChip.BackColor = [System.Drawing.Color]::FromArgb(25, 135, 84)
-$script:lblChip.ForeColor = [System.Drawing.Color]::White
-$script:lblChip.Padding   = New-Object System.Windows.Forms.Padding(8,3,8,3)
-$script:lblChip.Text      = "READY"
-$script:lblChip.Location  = New-Object System.Drawing.Point(420, 14)
-$form.Controls.Add($script:lblChip)
-
-
-# About/build line
-$lblAbout = New-Object System.Windows.Forms.Label
-$lblAbout.AutoSize  = $true
-$lblAbout.Font      = New-Object System.Drawing.Font("Segoe UI", 8)
-$lblAbout.ForeColor = [System.Drawing.Color]::DimGray
-$lblAbout.Text = "$AppName  $BuildStamp  |  $AppOwner"
-$lblAbout.Location  = New-Object System.Drawing.Point(14, 54)
-$form.Controls.Add($lblAbout)
-
-# Compute where the "content" should begin (under the banner/about line)
-$ContentTop = $lblAbout.Bottom + 18   # <-- adjust 14 to 18 if you want more air
-
-# Header height so we can push the top group down safely
-$HeaderYOffset = 70
-# ===== End Header =====
-
-$form.Text = "RehaHashVerify – Evidence Integrity Utility (v1.0)"
-$form.Size = New-Object System.Drawing.Size(920, 900)
-$form.StartPosition = "CenterScreen"
-$form.MaximizeBox = $false
+$form.Text            = "$AppName - $BuildStamp"
+$form.Size            = New-Object System.Drawing.Size(940, 930)
+$form.StartPosition   = "CenterScreen"
+$form.MaximizeBox     = $false
 $form.FormBorderStyle = "FixedDialog"
+$form.BackColor       = [System.Drawing.Color]::FromArgb(246,247,249)
 
 try {
-    # In PS2EXE builds, $PSCommandPath may be empty/invalid. Prefer the running EXE path.
     $selfPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-
-    if (-not [string]::IsNullOrWhiteSpace($selfPath) -and (Test-Path -LiteralPath $selfPath -PathType Leaf)) {
+    if ($selfPath -and (Test-Path -LiteralPath $selfPath -PathType Leaf)) {
         $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($selfPath)
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
-        $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($PSCommandPath)
-    }
-} catch {
-    # Do nothing: icon is cosmetic; never crash the app for this.
+} catch {}
+
+# Header
+$hdr = New-Object System.Windows.Forms.Panel
+$hdr.Location = New-Object System.Drawing.Point(0,0)
+$hdr.Size = New-Object System.Drawing.Size($form.ClientSize.Width, 84)
+$hdr.BackColor = [System.Drawing.Color]::White
+$hdr.Anchor = "Top,Left,Right"
+$form.Controls.Add($hdr)
+
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.AutoSize = $true
+$lblTitle.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 13)
+$lblTitle.Text = $AppName
+$lblTitle.Location = New-Object System.Drawing.Point(14, 14)
+$hdr.Controls.Add($lblTitle)
+
+$lblSub = New-Object System.Windows.Forms.Label
+$lblSub.AutoSize = $true
+$lblSub.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$lblSub.ForeColor = [System.Drawing.Color]::DimGray
+$lblSub.Text = "$BuildStamp  |  $AppOwner"
+$lblSub.Location = New-Object System.Drawing.Point(16, 44)
+$hdr.Controls.Add($lblSub)
+
+# Big pill status (right)
+$script:lblChip = New-Object ($PillLabelType.FullName)
+$script:lblChip.Text = "READY"
+$script:lblChip.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 12)
+$script:lblChip.Padding = New-Object System.Windows.Forms.Padding(26, 12, 26, 12)
+$script:lblChip.CornerRadius = 22
+$script:lblChip.BorderThickness = 1
+$script:lblChip.BorderColor = [System.Drawing.Color]::FromArgb(210, 230, 220)
+$script:lblChip.ShadowOffsetX = 0
+$script:lblChip.ShadowOffsetY = 4
+$script:lblChip.ShadowBlur = 10
+$script:lblChip.ShadowColor = [System.Drawing.Color]::FromArgb(70, 0, 0, 0)
+$script:lblChip.AutoSizeToContent()
+$script:lblChip.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - $script:lblChip.Width - 18), 18)
+$script:lblChip.Anchor = "Top,Right"
+$hdr.Controls.Add($script:lblChip)
+
+function Set-ChipState {
+    param([string]$Text, [int[]]$Rgb)
+    $script:lblChip.Text = $Text
+    $script:lblChip.BackColor = [System.Drawing.Color]::FromArgb($Rgb[0], $Rgb[1], $Rgb[2])
+    $script:lblChip.AutoSizeToContent()
+    $script:lblChip.Location = New-Object System.Drawing.Point(($form.ClientSize.Width - $script:lblChip.Width - 18), 18)
+    $script:lblChip.Invalidate()
 }
 
+$ContentTop = $hdr.Bottom + 10
 
+# Dialog
 $openFile = New-Object System.Windows.Forms.OpenFileDialog
-$openFile.Title = "Select file"
+$openFile.Title  = "Select file"
 $openFile.Filter = "All files (*.*)|*.*"
 
+# Groups
 $grpFiles = New-Object System.Windows.Forms.GroupBox
-$grpFiles.Text = "Files to Verify (drag-and-drop; you can drop ZIP + Keychain together)"
+$grpFiles.Text = "Files to Verify (drag-and-drop ZIP + Keychain)"
 $grpFiles.Location = New-Object System.Drawing.Point(12, $ContentTop)
-$grpFiles.Size = New-Object System.Drawing.Size(880, 140)
+$grpFiles.Size = New-Object System.Drawing.Size(900, 140)
 $form.Controls.Add($grpFiles)
 
-# --- ZIP + Keychain rows (pixel-perfect alignment) ---
-$Left   = 12
-$LabelW = 90          # <-- key fix: wide enough for "Keychain:"
-$Gap    = 8
-$BtnW   = 90
-$BtnH   = 26
-$RowH   = 26
-
+$Left=12; $LabelW=90; $Gap=8; $BtnW=100; $BtnH=28
 $txtX = $Left + $LabelW + $Gap
-$btnX = 770           # keep your existing right edge inside the group
+$btnX = 785
 $txtW = $btnX - $txtX - 10
 
-# ZIP row
 $lblZip = New-Object System.Windows.Forms.Label
-$lblZip.Text = "ZIP:"
-$lblZip.Location = New-Object System.Drawing.Point($Left, 30)
-$lblZip.AutoSize = $false
-$lblZip.Size = New-Object System.Drawing.Size($LabelW, 22)
-$lblZip.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$lblZip.Text="ZIP:"
+$lblZip.Location=New-Object System.Drawing.Point($Left,30)
+$lblZip.Size=New-Object System.Drawing.Size($LabelW,22)
+$lblZip.TextAlign=[System.Drawing.ContentAlignment]::MiddleLeft
 $grpFiles.Controls.Add($lblZip)
 
 $txtZip = New-Object System.Windows.Forms.TextBox
-$txtZip.Location = New-Object System.Drawing.Point($txtX, 27)
-$txtZip.Size = New-Object System.Drawing.Size($txtW, 22)
-$txtZip.ReadOnly = $true
-$txtZip.AllowDrop = $true
+$txtZip.Location=New-Object System.Drawing.Point($txtX,27)
+$txtZip.Size=New-Object System.Drawing.Size($txtW,24)
+$txtZip.ReadOnly=$true
 $grpFiles.Controls.Add($txtZip)
 
 $btnZip = New-Object System.Windows.Forms.Button
-$btnZip.Text = "Browse..."
-$btnZip.Location = New-Object System.Drawing.Point($btnX, 25)
-$btnZip.Size = New-Object System.Drawing.Size($BtnW, $BtnH)   # <-- DO NOT let this get huge
+$btnZip.Text="Browse..."
+$btnZip.Location=New-Object System.Drawing.Point($btnX,25)
+$btnZip.Size=New-Object System.Drawing.Size($BtnW,$BtnH)
 $grpFiles.Controls.Add($btnZip)
 
-# Keychain row
 $lblKC = New-Object System.Windows.Forms.Label
-$lblKC.Text = "Keychain:"
-$lblKC.Location = New-Object System.Drawing.Point($Left, 73)
-$lblKC.AutoSize = $false
-$lblKC.Size = New-Object System.Drawing.Size($LabelW, 22)     # <-- key fix
-$lblKC.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$lblKC.Text="Keychain:"
+$lblKC.Location=New-Object System.Drawing.Point($Left,73)
+$lblKC.Size=New-Object System.Drawing.Size($LabelW,22)
+$lblKC.TextAlign=[System.Drawing.ContentAlignment]::MiddleLeft
 $grpFiles.Controls.Add($lblKC)
 
 $txtKC = New-Object System.Windows.Forms.TextBox
-$txtKC.Location = New-Object System.Drawing.Point($txtX, 70)
-$txtKC.Size = New-Object System.Drawing.Size($txtW, 22)
-$txtKC.ReadOnly = $true
-$txtKC.AllowDrop = $true
+$txtKC.Location=New-Object System.Drawing.Point($txtX,70)
+$txtKC.Size=New-Object System.Drawing.Size($txtW,24)
+$txtKC.ReadOnly=$true
 $grpFiles.Controls.Add($txtKC)
 
 $btnKC = New-Object System.Windows.Forms.Button
-$btnKC.Text = "Browse..."
-$btnKC.Location = New-Object System.Drawing.Point($btnX, 68)
-$btnKC.Size = New-Object System.Drawing.Size($BtnW, $BtnH)
+$btnKC.Text="Browse..."
+$btnKC.Location=New-Object System.Drawing.Point($btnX,68)
+$btnKC.Size=New-Object System.Drawing.Size($BtnW,$BtnH)
 $grpFiles.Controls.Add($btnKC)
-# --- end ZIP + Keychain rows ---
 
+Enable-DropToBox -Box $txtZip -ZipBox $txtZip -KcBox $txtKC
+Enable-DropToBox -Box $txtKC  -ZipBox $txtZip -KcBox $txtKC
 
 $grpMeta = New-Object System.Windows.Forms.GroupBox
-$grpMeta.Text = "Optional Metadata (written to report header)"
-$grpMeta.Location = New-Object System.Drawing.Point(12, 145)
-$grpMeta.Size = New-Object System.Drawing.Size(880, 85)
+$grpMeta.Text = "Optional Metadata"
+$grpMeta.Location = New-Object System.Drawing.Point(12, ($grpFiles.Bottom + 10))
+$grpMeta.Size = New-Object System.Drawing.Size(900, 85)
 $form.Controls.Add($grpMeta)
 
 $lblCase = New-Object System.Windows.Forms.Label
-$lblCase.Text = "Case #:"
-$lblCase.Location = New-Object System.Drawing.Point(12, 34)
-$lblCase.AutoSize = $true
+$lblCase.Text="Case #:"
+$lblCase.Location=New-Object System.Drawing.Point(12,34)
+$lblCase.AutoSize=$true
 $grpMeta.Controls.Add($lblCase)
 
 $txtCase = New-Object System.Windows.Forms.TextBox
-$txtCase.Location = New-Object System.Drawing.Point(70, 31)
-$txtCase.Size = New-Object System.Drawing.Size(220, 22)
+$txtCase.Location=New-Object System.Drawing.Point(70,31)
+$txtCase.Size=New-Object System.Drawing.Size(230,24)
 $grpMeta.Controls.Add($txtCase)
 
 $lblItem = New-Object System.Windows.Forms.Label
-$lblItem.Text = "Item #:"
-$lblItem.Location = New-Object System.Drawing.Point(310, 34)
-$lblItem.AutoSize = $true
+$lblItem.Text="Item #:"
+$lblItem.Location=New-Object System.Drawing.Point(320,34)
+$lblItem.AutoSize=$true
 $grpMeta.Controls.Add($lblItem)
 
 $txtItem = New-Object System.Windows.Forms.TextBox
-$txtItem.Location = New-Object System.Drawing.Point(365, 31)
-$txtItem.Size = New-Object System.Drawing.Size(170, 22)
+$txtItem.Location=New-Object System.Drawing.Point(375,31)
+$txtItem.Size=New-Object System.Drawing.Size(180,24)
 $grpMeta.Controls.Add($txtItem)
 
 $lblExam = New-Object System.Windows.Forms.Label
-$lblExam.Text = "Examiner:"
-$lblExam.Location = New-Object System.Drawing.Point(555, 34)
-$lblExam.AutoSize = $true
+$lblExam.Text="Examiner:"
+$lblExam.Location=New-Object System.Drawing.Point(575,34)
+$lblExam.AutoSize=$true
 $grpMeta.Controls.Add($lblExam)
 
 $txtExam = New-Object System.Windows.Forms.TextBox
-$txtExam.Location = New-Object System.Drawing.Point(625, 31)
-$txtExam.Size = New-Object System.Drawing.Size(235, 22)
+$txtExam.Location=New-Object System.Drawing.Point(645,31)
+$txtExam.Size=New-Object System.Drawing.Size(245,24)
 $grpMeta.Controls.Add($txtExam)
 
 $grpExp = New-Object System.Windows.Forms.GroupBox
-$grpExp.Text = "Expected Hashes (SHA-256 first, then MD5)"
-$grpExp.Location = New-Object System.Drawing.Point(12, 240)
-$grpExp.Size = New-Object System.Drawing.Size(880, 210)
+$grpExp.Text = "Expected Hashes (optional)"
+$grpExp.Location = New-Object System.Drawing.Point(12, ($grpMeta.Bottom + 10))
+$grpExp.Size = New-Object System.Drawing.Size(900, 210)
 $form.Controls.Add($grpExp)
-# Reflow downstream groups (prevents overlap)
-$grpMeta.Location = New-Object System.Drawing.Point(12, ($grpFiles.Bottom + 10))
-$grpExp.Location  = New-Object System.Drawing.Point(12, ($grpMeta.Bottom + 10))
-
 
 $lblZipSHA = New-Object System.Windows.Forms.Label
-$lblZipSHA.Text = "ZIP SHA-256:"
-$lblZipSHA.Location = New-Object System.Drawing.Point(12, 35)
-$lblZipSHA.AutoSize = $true
+$lblZipSHA.Text="ZIP SHA-256:"
+$lblZipSHA.Location=New-Object System.Drawing.Point(12,35)
+$lblZipSHA.AutoSize=$true
 $grpExp.Controls.Add($lblZipSHA)
 
 $txtZipSHA = New-Object System.Windows.Forms.TextBox
-$txtZipSHA.Location = New-Object System.Drawing.Point(110, 32)
-$txtZipSHA.Size = New-Object System.Drawing.Size(750, 22)
+$txtZipSHA.Location=New-Object System.Drawing.Point(120,32)
+$txtZipSHA.Size=New-Object System.Drawing.Size(770,24)
 $grpExp.Controls.Add($txtZipSHA)
 
 $lblZipMD5 = New-Object System.Windows.Forms.Label
-$lblZipMD5.Text = "ZIP MD5:"
-$lblZipMD5.Location = New-Object System.Drawing.Point(12, 65)
-$lblZipMD5.AutoSize = $true
+$lblZipMD5.Text="ZIP MD5:"
+$lblZipMD5.Location=New-Object System.Drawing.Point(12,70)
+$lblZipMD5.AutoSize=$true
 $grpExp.Controls.Add($lblZipMD5)
 
 $txtZipMD5 = New-Object System.Windows.Forms.TextBox
-$txtZipMD5.Location = New-Object System.Drawing.Point(110, 62)
-$txtZipMD5.Size = New-Object System.Drawing.Size(750, 22)
+$txtZipMD5.Location=New-Object System.Drawing.Point(120,67)
+$txtZipMD5.Size=New-Object System.Drawing.Size(770,24)
 $grpExp.Controls.Add($txtZipMD5)
 
 $lblKCSHA = New-Object System.Windows.Forms.Label
-$lblKCSHA.Text = "KC SHA-256:"
-$lblKCSHA.Location = New-Object System.Drawing.Point(12, 120)
-$lblKCSHA.AutoSize = $true
+$lblKCSHA.Text="KC SHA-256:"
+$lblKCSHA.Location=New-Object System.Drawing.Point(12,125)
+$lblKCSHA.AutoSize=$true
 $grpExp.Controls.Add($lblKCSHA)
 
 $txtKCSHA = New-Object System.Windows.Forms.TextBox
-$txtKCSHA.Location = New-Object System.Drawing.Point(110, 117)
-$txtKCSHA.Size = New-Object System.Drawing.Size(750, 22)
+$txtKCSHA.Location=New-Object System.Drawing.Point(120,122)
+$txtKCSHA.Size=New-Object System.Drawing.Size(770,24)
 $grpExp.Controls.Add($txtKCSHA)
 
 $lblKCMD5 = New-Object System.Windows.Forms.Label
-$lblKCMD5.Text = "KC MD5:"
-$lblKCMD5.Location = New-Object System.Drawing.Point(12, 150)
-$lblKCMD5.AutoSize = $true
+$lblKCMD5.Text="KC MD5:"
+$lblKCMD5.Location=New-Object System.Drawing.Point(12,160)
+$lblKCMD5.AutoSize=$true
 $grpExp.Controls.Add($lblKCMD5)
 
 $txtKCMD5 = New-Object System.Windows.Forms.TextBox
-$txtKCMD5.Location = New-Object System.Drawing.Point(110, 147)
-$txtKCMD5.Size = New-Object System.Drawing.Size(750, 22)
+$txtKCMD5.Location=New-Object System.Drawing.Point(120,157)
+$txtKCMD5.Size=New-Object System.Drawing.Size(770,24)
 $grpExp.Controls.Add($txtKCMD5)
 
-# --- Button row placed dynamically under Expected Hashes group ---
+# Auto-clear highlight when user edits (register ONCE)
+$txtZipSHA.Add_TextChanged({ Clear-InputHighlight -Box $txtZipSHA })
+$txtZipMD5.Add_TextChanged({ Clear-InputHighlight -Box $txtZipMD5 })
+$txtKCSHA.Add_TextChanged({ Clear-InputHighlight -Box $txtKCSHA })
+$txtKCMD5.Add_TextChanged({ Clear-InputHighlight -Box $txtKCMD5 })
+
+# Buttons
 $btnY = $grpExp.Bottom + 12
 
 $btnRun = New-Object System.Windows.Forms.Button
 $btnRun.Text = "Verify and Generate Report"
 $btnRun.Location = New-Object System.Drawing.Point(12, $btnY)
-$btnRun.Size = New-Object System.Drawing.Size(360, 36)
+$btnRun.Size = New-Object System.Drawing.Size(280, 40)
 $form.Controls.Add($btnRun)
-
-$btnSaveAs = New-Object System.Windows.Forms.Button
-$btnSaveAs.Text = "Save As..."
-$btnSaveAs.Location = New-Object System.Drawing.Point(($btnRun.Right + 10), $btnY)
-$btnSaveAs.Size = New-Object System.Drawing.Size(120, 36)
-$btnSaveAs.Enabled = $false
-$btnSaveAs.Visible = $false
-$form.Controls.Add($btnSaveAs)
 
 $btnCancel = New-Object System.Windows.Forms.Button
 $btnCancel.Text = "Cancel"
-$btnCancel.Location = New-Object System.Drawing.Point(($btnSaveAs.Right + 10), $btnY)
-$btnCancel.Size = New-Object System.Drawing.Size(100, 36)
+$btnCancel.Location = New-Object System.Drawing.Point(($btnRun.Right + 10), $btnY)
+$btnCancel.Size = New-Object System.Drawing.Size(100, 40)
 $btnCancel.Enabled = $false
 $form.Controls.Add($btnCancel)
 
-$ButtonsBottom = $btnCancel.Bottom
+$btnCopyPath = New-Object System.Windows.Forms.Button
+$btnCopyPath.Text = "Copy Report Path"
+$btnCopyPath.Location = New-Object System.Drawing.Point(($btnCancel.Right + 10), $btnY)
+$btnCopyPath.Size = New-Object System.Drawing.Size(160, 40)
+$btnCopyPath.Enabled = $false
+$form.Controls.Add($btnCopyPath)
 
-# Status label
+$btnOpenFolder = New-Object System.Windows.Forms.Button
+$btnOpenFolder.Text = "Open Folder"
+$btnOpenFolder.Location = New-Object System.Drawing.Point(($btnCopyPath.Right + 10), $btnY)
+$btnOpenFolder.Size = New-Object System.Drawing.Size(130, 40)
+$btnOpenFolder.Enabled = $false
+$form.Controls.Add($btnOpenFolder)
+
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Text = "Status: Select ZIP and/or Keychain."
-$lblStatus.Location = New-Object System.Drawing.Point(12, ($ButtonsBottom + 12))
+$lblStatus.Location = New-Object System.Drawing.Point(12, ($btnRun.Bottom + 12))
 $lblStatus.AutoSize = $true
 $form.Controls.Add($lblStatus)
 
-# Progress bar
 $progressBar = New-Object System.Windows.Forms.ProgressBar
 $progressBar.Location = New-Object System.Drawing.Point(12, ($lblStatus.Bottom + 6))
-$progressBar.Size     = New-Object System.Drawing.Size(780, 18)
+$progressBar.Size = New-Object System.Drawing.Size(800, 18)
 $progressBar.Minimum = 0
 $progressBar.Maximum = 100
 $form.Controls.Add($progressBar)
 
-# Progress text (GB readout)
 $lblProgress = New-Object System.Windows.Forms.Label
 $lblProgress.Location = New-Object System.Drawing.Point(($progressBar.Right + 10), $progressBar.Top)
 $lblProgress.AutoSize = $true
 $lblProgress.ForeColor = [System.Drawing.Color]::DimGray
 $form.Controls.Add($lblProgress)
 
-# Output box
 $txtOutput = New-Object System.Windows.Forms.TextBox
 $txtOutput.Multiline = $true
 $txtOutput.ScrollBars = "Vertical"
 $txtOutput.ReadOnly = $true
 $txtOutput.Font = New-Object System.Drawing.Font("Consolas", 10)
 $txtOutput.Location = New-Object System.Drawing.Point(12, ($progressBar.Bottom + 10))
-$txtOutput.Size     = New-Object System.Drawing.Size(880, 260)
+$txtOutput.Size = New-Object System.Drawing.Size(900, 260)
 $form.Controls.Add($txtOutput)
 
-# Make window tall enough so nothing is cut off
-$form.ClientSize = New-Object System.Drawing.Size(920, ($txtOutput.Bottom + 20))
+$form.ClientSize = New-Object System.Drawing.Size(940, ($txtOutput.Bottom + 20))
 
-
-$saveFile = New-Object System.Windows.Forms.SaveFileDialog
-$saveFile.Title = "Save verification report"
-$saveFile.Filter = "Text file (*.txt)|*.txt"
-$saveFile.OverwritePrompt = $true
-
-# enable multi-file drop
-Enable-DropToBox -Box $txtZip -ZipBox $txtZip -KcBox $txtKC
-Enable-DropToBox -Box $txtKC  -ZipBox $txtZip -KcBox $txtKC
-
+# Browse handlers
 $btnZip.Add_Click({
-    if ($openFile.ShowDialog() -eq "OK") {
-        [void](Set-PathIfValid -Box $txtZip -Path $openFile.FileName)
+    if ($openFile.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtZip.Text = Normalize-InputPath $openFile.FileName
     }
 })
 $btnKC.Add_Click({
-    if ($openFile.ShowDialog() -eq "OK") {
-        [void](Set-PathIfValid -Box $txtKC -Path $openFile.FileName)
+    if ($openFile.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtKC.Text = Normalize-InputPath $openFile.FileName
     }
 })
 
-# BackgroundWorker wiring (C# DoWork delegate)
+# ---------------- Background Worker ----------------
 $worker = New-Object System.ComponentModel.BackgroundWorker
 $worker.WorkerReportsProgress = $true
 $worker.WorkerSupportsCancellation = $true
 
-$hashWorker = New-Object HashWorker
-$mi = $hashWorker.GetType().GetMethod("DoWork")
+$hashWorker = New-Object ($HashWorkerType.FullName)
+$mi  = $hashWorker.GetType().GetMethod("DoWork")
 $del = [System.Delegate]::CreateDelegate([System.ComponentModel.DoWorkEventHandler], $hashWorker, $mi)
 $worker.add_DoWork($del)
 
-$lastMeta = $null
-$lastZipSection = $null
-$lastKCSection = $null
-$lastDefaultReportPath = $null
+# Shared state must be script-scoped - event handlers
+$script:lastMeta = $null
+$script:lastZipSection = $null
+$script:lastKCSection = $null
+$script:lastDefaultReportPath = $null
 
 $worker.Add_ProgressChanged({
     param($sender, $e)
-    $progressBar.Value = $e.ProgressPercentage
+
+    $pct = $e.ProgressPercentage
+    if ($pct -lt 0) { $pct = 0 }
+    if ($pct -gt 100) { $pct = 100 }
+    $progressBar.Value = $pct
+
     $u = $e.UserState
     if ($u) {
         $doneGB  = [math]::Round(($u["BytesRead"] / 1GB), 2)
@@ -896,32 +1009,27 @@ $worker.Add_RunWorkerCompleted({
     $btnCancel.Enabled = $false
 
     if ($e.Cancelled) {
-		    Set-ChipState -Text "CANCELLED" -Rgb @(108,117,125) 
+        Set-ChipState -Text "CANCELLED" -Rgb @(108,117,125)
         $lblStatus.Text = "Status: Cancelled"
         $txtOutput.Text = "Cancelled by user."
         return
     }
 
     if ($e.Error) {
+        $msg = $e.Error.ToString()
+        if ($e.Error -is [System.OperationCanceledException] -or $msg -match 'OperationCanceledException') {
+            Set-ChipState -Text "CANCELLED" -Rgb @(108,117,125)
+            $lblStatus.Text = "Status: Cancelled"
+            $txtOutput.Text = "Cancelled by user."
+            return
+        }
 
-    # Treat cancellation exceptions as a normal cancel (not an error)
-    $msg = $e.Error.ToString()
-    if ($e.Error -is [System.OperationCanceledException] -or $msg -match 'OperationCanceledException') {
-
-        Set-ChipState -Text "CANCELLED" -Rgb @(108,117,125)   # gray
-        $lblStatus.Text = "Status: Cancelled"
-        $txtOutput.Text = "Cancelled by user."
+        Set-ChipState -Text "FAILED" -Rgb @(220,53,69)
+        $lblStatus.Text = "Status: ERROR"
+        $txtOutput.Text = "ERROR:`r`n$($e.Error.ToString())"
+        [System.Windows.Forms.MessageBox]::Show($e.Error.ToString(), "Error", "OK", "Error") | Out-Null
         return
     }
-
-    # Real errors
-    Set-ChipState -Text "FAILED" -Rgb @(220,53,69)           # red
-    $lblStatus.Text = "Status: ERROR"
-    $txtOutput.Text = "ERROR:`r`n$($e.Error.ToString())"
-    [System.Windows.Forms.MessageBox]::Show($e.Error.ToString(), "Error", "OK", "Error") | Out-Null
-    return
-}
-
 
     $result = $e.Result
     $overall = $result["Overall"]
@@ -939,24 +1047,26 @@ $worker.Add_RunWorkerCompleted({
     }
 
     $baseDir = if ($zipSection) { Split-Path -Parent $zipSection.FilePath } else { Split-Path -Parent $kcSection.FilePath }
-    $lastDefaultReportPath = Build-DefaultReportPath -BaseDir $baseDir -CaseNumber $meta.CaseNumber -ItemNumber $meta.ItemNumber
+    $script:lastDefaultReportPath = Build-DefaultReportPath -BaseDir $baseDir -CaseNumber $meta.CaseNumber -ItemNumber $meta.ItemNumber
 
-    Write-CombinedReport -ReportPath $lastDefaultReportPath -Meta $meta -ZipSection $zipSection -KeychainSection $kcSection
+    Write-CombinedReport -ReportPath $script:lastDefaultReportPath -Meta $meta -ZipSection $zipSection -KeychainSection $kcSection
 
     $summary = @()
     if ($zipSection) { $summary += "ZIP Result: $($zipSection.FileOverall)" }
     if ($kcSection)  { $summary += "Keychain Result: $($kcSection.FileOverall)" }
     $summary += "OVERALL: $overall"
-    $summary += "REPORT SAVED: $lastDefaultReportPath"
+    $summary += "REPORT SAVED: $script:lastDefaultReportPath"
 
     $txtOutput.Text = ($summary -join "`r`n")
-	Set-ChipState -Text "COMPLETE" -Rgb @(25,135,84)
+    Set-ChipState -Text "COMPLETE" -Rgb @(25,135,84)
     $lblStatus.Text = "Status: Done. Overall = $overall"
-    $btnSaveAs.Enabled = $true
 
-    $lastMeta = $meta
-    $lastZipSection = $zipSection
-    $lastKCSection = $kcSection
+    $btnCopyPath.Enabled   = $true
+    $btnOpenFolder.Enabled = $true
+
+    $script:lastMeta       = $meta
+    $script:lastZipSection = $zipSection
+    $script:lastKCSection  = $kcSection
 })
 
 $btnCancel.Add_Click({
@@ -967,68 +1077,130 @@ $btnCancel.Add_Click({
     }
 })
 
+# use $script:lastDefaultReportPath
+$btnCopyPath.Add_Click({
+    if (-not [string]::IsNullOrWhiteSpace($script:lastDefaultReportPath)) {
+        [System.Windows.Forms.Clipboard]::SetText($script:lastDefaultReportPath)
+        [System.Windows.Forms.MessageBox]::Show("Copied:`n$script:lastDefaultReportPath", "Copied", "OK", "Information") | Out-Null
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("No report path available yet. Run a verification first.", "Not Ready", "OK", "Warning") | Out-Null
+    }
+})
+
+# FIXED: uses $script:lastDefaultReportPath
+$btnOpenFolder.Add_Click({
+    $p = $script:lastDefaultReportPath
+    if ([string]::IsNullOrWhiteSpace($p)) {
+        [System.Windows.Forms.MessageBox]::Show("No report path available yet. Run a verification first.", "Not Ready", "OK", "Warning") | Out-Null
+        return
+    }
+
+    if (Test-Path -LiteralPath $p -PathType Leaf) {
+        Start-Process explorer.exe "/select,`"$p`""
+        return
+    }
+
+    $dir = Split-Path -Parent $p
+    if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+        Start-Process explorer.exe "`"$dir`""
+        return
+    }
+
+    [System.Windows.Forms.MessageBox]::Show("Report path not found:`n$p", "Not Found", "OK", "Error") | Out-Null
+})
+
+# ---------------- Run ----------------
 $btnRun.Add_Click({
     try {
-        # Defense-in-depth: normalize again right before hashing
+        # Reset highlights at start of run
+        Clear-InputHighlight -Box $txtZipSHA
+        Clear-InputHighlight -Box $txtZipMD5
+        Clear-InputHighlight -Box $txtKCSHA
+        Clear-InputHighlight -Box $txtKCMD5
+
         $zipPath = Normalize-InputPath -Path $txtZip.Text
         $kcPath  = Normalize-InputPath -Path $txtKC.Text
-		$txtZip.Text = $zipPath
-		$txtKC.Text  = $kcPath
+        $txtZip.Text = $zipPath
+        $txtKC.Text  = $kcPath
 
-# Detect invisible/illegal characters before we pass to C#
-$zipReport = Get-IllegalPathCharsReport -p $zipPath
-$kcReport  = Get-IllegalPathCharsReport -p $kcPath
+        $zipReport = Get-IllegalPathCharsReport -p $zipPath
+        $kcReport  = Get-IllegalPathCharsReport -p $kcPath
 
-if ($zipReport -ne "No illegal chars detected.") {
-    [System.Windows.Forms.MessageBox]::Show("ZIP path issue:`r`n$zipReport`r`n`r`nValue:`r`n$zipPath", "Invalid ZIP Path", "OK", "Error") | Out-Null
-    return
-}
-if ($kcReport -ne "No illegal chars detected.") {
-    [System.Windows.Forms.MessageBox]::Show("Keychain path issue:`r`n$kcReport`r`n`r`nValue:`r`n$kcPath", "Invalid Keychain Path", "OK", "Error") | Out-Null
-    return
-}
+        if ($zipReport -ne "No illegal chars detected.") {
+            [System.Windows.Forms.MessageBox]::Show("ZIP path issue:`r`n$zipReport`r`n`r`nValue:`r`n$zipPath", "Invalid ZIP Path", "OK", "Error") | Out-Null
+            return
+        }
+        if ($kcReport -ne "No illegal chars detected.") {
+            [System.Windows.Forms.MessageBox]::Show("Keychain path issue:`r`n$kcReport`r`n`r`nValue:`r`n$kcPath", "Invalid Keychain Path", "OK", "Error") | Out-Null
+            return
+        }
 
-if (-not [string]::IsNullOrWhiteSpace($zipPath) -and 
-    -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
-    throw "ZIP file not found: <$zipPath>"
-}
+        if (-not [string]::IsNullOrWhiteSpace($zipPath) -and -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw "ZIP file not found: <$zipPath>"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($kcPath) -and -not (Test-Path -LiteralPath $kcPath -PathType Leaf)) {
+            throw "Keychain file not found: <$kcPath>"
+        }
+        if ([string]::IsNullOrWhiteSpace($zipPath) -and [string]::IsNullOrWhiteSpace($kcPath)) {
+            [System.Windows.Forms.MessageBox]::Show("Select at least one file (ZIP and/or Keychain).", "Missing Files", "OK", "Warning") | Out-Null
+            return
+        }
 
-if (-not [string]::IsNullOrWhiteSpace($kcPath) -and 
-    -not (Test-Path -LiteralPath $kcPath -PathType Leaf)) {
-    throw "Keychain file not found: <$kcPath>"
-}
-if ([string]::IsNullOrWhiteSpace($zipPath) -and 
-    [string]::IsNullOrWhiteSpace($kcPath)) {
+        # ---- Expected hashes (highlight + shake + field-specific message) ----
+        $v1 = Test-ExpectedHash -Value $txtZipSHA.Text -Alg SHA256 -LabelForError "ZIP SHA-256"
+        if (-not $v1.Ok) {
+            Mark-InputInvalid -Box $txtZipSHA
+            $txtZipSHA.Focus()
+            Shake-Control -Control $txtZipSHA
+            [System.Windows.Forms.MessageBox]::Show($v1.Error, "Invalid Input", "OK", "Error") | Out-Null
+            return
+        }
+        $txtZipSHA.Text = $v1.Normalized
 
-    [System.Windows.Forms.MessageBox]::Show(
-        "Select at least one file (ZIP and/or Keychain).",
-        "Missing Files",
-        "OK",
-        "Warning"
-    ) | Out-Null
+        $v2 = Test-ExpectedHash -Value $txtZipMD5.Text -Alg MD5 -LabelForError "ZIP MD5"
+        if (-not $v2.Ok) {
+            Mark-InputInvalid -Box $txtZipMD5
+            $txtZipMD5.Focus()
+            Shake-Control -Control $txtZipMD5
+            [System.Windows.Forms.MessageBox]::Show($v2.Error, "Invalid Input", "OK", "Error") | Out-Null
+            return
+        }
+        $txtZipMD5.Text = $v2.Normalized
 
-    return
-}
+        $v3 = Test-ExpectedHash -Value $txtKCSHA.Text -Alg SHA256 -LabelForError "KC SHA-256"
+        if (-not $v3.Ok) {
+            Mark-InputInvalid -Box $txtKCSHA
+            $txtKCSHA.Focus()
+            Shake-Control -Control $txtKCSHA
+            [System.Windows.Forms.MessageBox]::Show($v3.Error, "Invalid Input", "OK", "Error") | Out-Null
+            return
+        }
+        $txtKCSHA.Text = $v3.Normalized
 
+        $v4 = Test-ExpectedHash -Value $txtKCMD5.Text -Alg MD5 -LabelForError "KC MD5"
+        if (-not $v4.Ok) {
+            Mark-InputInvalid -Box $txtKCMD5
+            $txtKCMD5.Focus()
+            Shake-Control -Control $txtKCMD5
+            [System.Windows.Forms.MessageBox]::Show($v4.Error, "Invalid Input", "OK", "Error") | Out-Null
+            return
+        }
+        $txtKCMD5.Text = $v4.Normalized
 
-        # Update UI with normalized values (so EXE/PS1 behavior matches)
-$txtZip.Text = $zipPath
-$txtKC.Text  = $kcPath
-
+        # ---- Start worker ----
         $btnRun.Enabled = $false
-$btnSaveAs.Enabled = $false
-$btnCancel.Enabled = $true
-Set-ChipState -Text "RUNNING" -Rgb @(13, 110, 253)   # blue
+        $btnCancel.Enabled = $true
+        $btnCopyPath.Enabled = $false
+        $btnOpenFolder.Enabled = $false
 
-$progressBar.Value = 0
-
+        Set-ChipState -Text "RUNNING" -Rgb @(13,110,253)
         $progressBar.Value = 0
         $lblProgress.Text = ""
         $txtOutput.Clear()
         $lblStatus.Text = "Status: Starting..."
         $form.Refresh()
 
-        $job = New-Object HashJobArgs
+        $job = New-Object ($HashJobType.FullName)
         $job.ZipPath   = $zipPath
         $job.KcPath    = $kcPath
         $job.CaseNum   = $txtCase.Text.Trim()
@@ -1042,24 +1214,12 @@ $progressBar.Value = 0
         $worker.RunWorkerAsync($job)
     }
     catch {
-        Set-ChipState -Text "FAILED" -Rgb @(220, 53, 69)     # red
+        Set-ChipState -Text "FAILED" -Rgb @(220,53,69)
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Run Failed", "OK", "Error") | Out-Null
         $btnRun.Enabled = $true
-        $btnSaveAs.Enabled = $false
         $btnCancel.Enabled = $false
         $lblStatus.Text = "Status: ERROR"
         $txtOutput.Text = "ERROR:`r`n$($_.Exception.ToString())"
-    }
-})
-
-$btnSaveAs.Add_Click({
-    if (-not $lastMeta -or -not $lastDefaultReportPath) { return }
-    $saveFile.FileName = Split-Path -Leaf $lastDefaultReportPath
-    $saveFile.InitialDirectory = Split-Path -Parent $lastDefaultReportPath
-
-    if ($saveFile.ShowDialog() -eq "OK") {
-        Write-CombinedReport -ReportPath $saveFile.FileName -Meta $lastMeta -ZipSection $lastZipSection -KeychainSection $lastKCSection
-        [System.Windows.Forms.MessageBox]::Show("Saved:`n$($saveFile.FileName)", "Saved", "OK", "Information") | Out-Null
     }
 })
 
