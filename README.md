@@ -20,6 +20,11 @@ The tool is intended to support verification of forensic exports from tools such
 - SHA-256 and MD5 hashing
 - Automatic report generation
 - Overall verification status
+- RehaHashVerify supports the following workflows:
+  - GrayKey ZIP only
+  - Keychain Only
+  - GrayKey ZIP + Keychain
+      -If only one file is provided, the tool validates and hashes only that artifact and still generates a report.
 
 ## Requirements
 
@@ -55,4 +60,5 @@ After downloading a release asset, verify its SHA-256 hash:
 
 ```powershell
 Get-FileHash ".\RehaHashVerifyv1.1.exe" -Algorithm SHA256
+Get-FileHash ".\RehaHashVerifyv1.2.exe" -Algorithm SHA256
 
