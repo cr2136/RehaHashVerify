@@ -52,7 +52,9 @@ MIT License
 
 ## Downloads
 
-Compiled releases are available under the Releases section.
+Compiled releases are available under the Releases section or:
+
+https://github.com/cr2136/RehaHashVerify/releases/latest
 
 ## Verify downloads (recommended)
 
